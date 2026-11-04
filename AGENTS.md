@@ -117,6 +117,19 @@ checks the output against a context pixelforge created itself. It needs no
 ffmpeg. Anything that reaches a core 1.2 or 1.3 entry point panics there, so
 run it after touching submission or barrier code.
 
+Reference frame invalidation (`tests/rfi.rs`) recovers from the frames the
+encoder keeps in the DPB (the window, `max_reference_frames`), which can be
+more than each frame predicts from. A device that allows many references per
+frame never exercises that. `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` limits the
+references per frame without changing the window, to test it:
+
+```bash
+PIXELFORGE_MAX_ACTIVE_REFERENCES=1 cargo test --test rfi -- --ignored --nocapture
+```
+
+`RUST_LOG=pixelforge::encoder::codec=debug` reports the negotiated window and
+per-frame count, on the `Reference window` line.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

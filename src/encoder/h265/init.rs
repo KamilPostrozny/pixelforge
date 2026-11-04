@@ -80,10 +80,12 @@ impl H265 {
             profile_info: &profile_info,
             caps: &caps,
             align_unit: CTB_SIZE,
-            max_active_refs_cap: 15,
+            max_reference_window: 15,
+            max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
             allow_layered_dpb: true,
         })?;
+        let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
@@ -105,6 +107,7 @@ impl H265 {
             backward_reference_poc: 0,
             backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
+            reference_window,
             active_reference_count,
             profile_idc,
         };

@@ -328,7 +328,11 @@ pub struct EncodeConfig {
     pub gop_size: u32,
     /// Number of consecutive B-frames.
     pub b_frame_count: u32,
-    /// Maximum number of reference frames.
+    /// Maximum number of reference frames kept in the DPB: the window that
+    /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
+    /// can recover from. Each frame predicts from only as many of the newest
+    /// as the device allows, which can be fewer. The device's DPB size can
+    /// also lower it.
     pub max_reference_frames: u32,
     /// VBV/HRD virtual buffer size in milliseconds.
     /// Controls how much the encoder can deviate from the target bitrate
@@ -480,7 +484,8 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the maximum reference frames.
+    /// Set the maximum reference frames kept in the DPB (see
+    /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
         self
@@ -732,6 +737,10 @@ impl Encoder {
     /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
     /// re-anchors prediction to the most recent survivor, falling back to an
     /// IDR (AV1: key frame) only when the loss covers the entire window.
+    ///
+    /// The window does not depend on how many references the device can
+    /// predict from per frame. A device that predicts from one or two still
+    /// keeps the whole window, and recovers from the older frames in it.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         self.0.invalidate_reference_frames(first_lost_display_order)
     }
