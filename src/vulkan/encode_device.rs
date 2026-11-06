@@ -341,6 +341,8 @@ impl VideoContext {
                 supported_decode_codecs: Vec::new(),
                 has_push_descriptor: plan.push_descriptor,
                 has_unified_image_layouts: false,
+                // The caller created the queues.
+                queue_priority: None,
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.

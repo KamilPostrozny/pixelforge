@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `VideoContextBuilder::highest_queue_priority`, which creates the queues at the highest global priority the driver grants, and `VideoContext::queue_priority`.
+
 ## [0.10.0] - 19-10-2026
 
 ### Added
