@@ -192,6 +192,9 @@ pub(crate) struct EncodePipeline {
     work_tx: Option<Sender<WorkItem>>,
     /// The completion thread handle, joined on shutdown.
     completion_thread: Option<JoinHandle<()>>,
+    /// The completion thread's Linux thread ID, `None` off Linux or when
+    /// `/proc/thread-self` couldn't be read.
+    completion_thread_id: Option<u32>,
 }
 
 impl EncodePipeline {
@@ -299,12 +302,15 @@ impl EncodePipeline {
         // for fence waits, query reads and host-coherent buffer reads.
         let thread_device = device.clone();
         let thread_sync = slot_sync.clone();
+        let (thread_id_tx, thread_id_rx) = std::sync::mpsc::sync_channel::<Option<u32>>(1);
         let completion_thread = std::thread::Builder::new()
             .name("pixelforge-encode-readback".to_string())
             .spawn(move || {
+                let _ = thread_id_tx.send(current_thread_id());
                 run_completion_thread(thread_device, work_rx, thread_sync);
             })
             .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn readback thread: {e}")))?;
+        let completion_thread_id = thread_id_rx.recv().ok().flatten();
 
         Ok(Self {
             slots,
@@ -313,7 +319,13 @@ impl EncodePipeline {
             slot_sync,
             work_tx: Some(work_tx),
             completion_thread: Some(completion_thread),
+            completion_thread_id,
         })
+    }
+
+    /// The Linux thread ID of the thread that reads each encoded frame back.
+    pub(crate) fn completion_thread_id(&self) -> Option<u32> {
+        self.completion_thread_id
     }
 
     /// The slot the next frame will be encoded into.
@@ -513,6 +525,17 @@ impl EncodePipeline {
     }
 }
 
+/// The calling thread's Linux thread ID, read from `/proc/thread-self`
+/// (`<pid>/task/<tid>`).
+fn current_thread_id() -> Option<u32> {
+    std::fs::read_link("/proc/thread-self")
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .parse()
+        .ok()
+}
+
 /// Completion-thread body: wait on each submission's fence, copy its bitstream
 /// out, resolve the frame's future, then mark the slot free.
 fn run_completion_thread(
@@ -569,5 +592,27 @@ fn run_completion_thread(
         // receiver (future cancelled) makes the send a no-op, which is fine.
         let _ = work.result_tx.send(packet);
         slot_sync.set_free(work.slot_index);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_thread_id_is_the_calling_threads() {
+        let (tid, comm) = std::thread::Builder::new()
+            .name("thread-id-probe".to_string())
+            .spawn(|| {
+                let tid = current_thread_id().expect("thread id");
+                let comm =
+                    std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).expect("comm");
+                (tid, comm)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(comm.trim_end(), "thread-id-probe");
+        assert_ne!(Some(tid), current_thread_id());
     }
 }
