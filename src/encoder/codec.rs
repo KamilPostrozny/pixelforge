@@ -76,6 +76,9 @@ pub(crate) struct EncoderCommon {
     /// Caller work this frame's first submission must wait for. The upload
     /// takes them when it copies, otherwise the encode submission does.
     pub pending_waits: Vec<TimelinePoint>,
+    /// The pipeline slot whose input image holds the last frame encoded from
+    /// a source, for [`CodecEncoder::repeat`]. `None` before the first frame.
+    pub last_frame_slot: Option<usize>,
 }
 
 impl EncoderCommon {
@@ -91,6 +94,7 @@ impl EncoderCommon {
             gop,
             display_order,
             encode_index: self.encode_frame_num,
+            source_slot: self.pipeline.current_index(),
         }
     }
 
@@ -164,6 +168,9 @@ pub(crate) struct FramePlan {
     pub display_order: u64,
     /// Encode order (DTS); `0` marks the very first encoded frame.
     pub encode_index: u64,
+    /// The pipeline slot whose input image this frame is encoded from: the
+    /// current slot's own, except for a repeat of a frame another slot holds.
+    pub source_slot: usize,
 }
 
 impl FramePlan {
@@ -333,8 +340,38 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pending_waits.clear();
         self.common.pending_waits.extend_from_slice(wait);
         self.common.upload(src_image)?;
+        let future = self.encode_planned(&plan)?;
+        // Converted or copied there, the frame is in this slot's input image.
+        self.common.last_frame_slot = Some(plan.source_slot);
+        Ok(future)
+    }
 
-        let setup = self.codec.begin_picture(&mut self.common, &plan)?;
+    /// Encode the last frame again. See [`crate::Encoder::repeat`].
+    pub fn repeat(&mut self) -> Result<EncodeFuture> {
+        let Some(last) = self.common.last_frame_slot else {
+            return Err(PixelForgeError::InvalidInput(
+                "no frame to repeat: none was encoded since the encoder was made".to_string(),
+            ));
+        };
+        let mut plan = self.common.begin_frame();
+        self.common.pending_waits.clear();
+        // The encode reads the frame where it is and writes nothing into its
+        // own slot's input image, so the frame stays put for the next repeat.
+        let slot = plan.source_slot;
+        plan.source_slot = last;
+        let future = self.encode_planned(&plan)?;
+        if last != slot {
+            // The next frame can be written into that slot's image: wait
+            // until this encode has read it.
+            self.common.pipeline.wait_free(slot);
+        }
+        Ok(future)
+    }
+
+    /// Record and submit a planned frame from its source slot's input image,
+    /// then move on to the next slot.
+    fn encode_planned(&mut self, plan: &FramePlan) -> Result<EncodeFuture> {
+        let setup = self.codec.begin_picture(&mut self.common, plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
             frame_type: setup.frame_type,
             is_key_frame: plan.is_idr(),
@@ -345,9 +382,9 @@ impl<C: VideoCodec> CodecEncoder<C> {
             now: std::time::Instant::now(),
         });
 
-        let future = self.codec.record_picture(&mut self.common, &plan)?;
+        let future = self.codec.record_picture(&mut self.common, plan)?;
         self.common.encode_frame_num += 1;
-        self.codec.end_picture(&mut self.common, &plan);
+        self.codec.end_picture(&mut self.common, plan);
         self.common.advance();
         Ok(future)
     }
@@ -783,6 +820,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
         pending_waits: Vec::new(),
+        last_frame_slot: None,
     };
 
     Ok(CommonInit {

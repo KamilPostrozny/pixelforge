@@ -324,6 +324,16 @@ impl EncodePipeline {
         &mut self.slots[self.current_slot]
     }
 
+    /// Index of the slot the next frame will be encoded into.
+    pub(crate) fn current_index(&self) -> usize {
+        self.current_slot
+    }
+
+    /// The slot at `index`.
+    pub(crate) fn slot(&self, index: usize) -> &EncodeSlot {
+        &self.slots[index]
+    }
+
     /// Return the current slot's input image, first waiting until the slot is
     /// free so it is safe to use as a convert/upload target (write-after-read on
     /// the shared input image).
@@ -335,6 +345,11 @@ impl EncodePipeline {
     /// Wait until the current slot is free to record over and submit.
     pub(crate) fn wait_current_free(&self) {
         self.slot_sync.wait_free(self.current_slot);
+    }
+
+    /// Wait until slot `index` is free: its submission has been read back.
+    pub(crate) fn wait_free(&self, index: usize) {
+        self.slot_sync.wait_free(index);
     }
 
     /// Wait until every in-flight submission has been read back. Used before

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `Encoder::repeat`: encode the last frame again from the encoder's own
+  input image, for a key frame while no new frame arrives.
+
 ## [0.10.0] - 19-10-2026
 
 ### Added

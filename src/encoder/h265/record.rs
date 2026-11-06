@@ -31,7 +31,7 @@ impl H265 {
         let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
-        let input_image_view = slot.input_image_view;
+        let input_image_view = common.pipeline.slot(plan.source_slot).input_image_view;
 
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;

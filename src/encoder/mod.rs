@@ -597,6 +597,7 @@ trait EncoderApi: Send {
         src_image: vk::Image,
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture>;
+    fn repeat(&mut self) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
@@ -613,6 +614,9 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
         codec::CodecEncoder::encode_after(self, src_image, wait)
+    }
+    fn repeat(&mut self) -> Result<EncodeFuture> {
+        codec::CodecEncoder::repeat(self)
     }
     fn flush(&mut self) -> Result<()> {
         codec::CodecEncoder::flush(self)
@@ -715,6 +719,20 @@ impl Encoder {
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
         self.0.encode_after(src_image, wait)
+    }
+
+    /// Encode the last frame again: an IDR if one was requested, for a client
+    /// that needs a key frame while no new frame arrives.
+    ///
+    /// The encoder still holds the last frame in an input image, so the
+    /// caller's source does not have to stay alive or unchanged. When that
+    /// image is another slot's, this waits on the CPU until the encode is
+    /// done, because the next frame can be written into it.
+    ///
+    /// An error if there is no last frame to repeat: nothing was encoded since
+    /// the encoder was made.
+    pub fn repeat(&mut self) -> Result<EncodeFuture> {
+        self.0.repeat()
     }
 
     /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).
