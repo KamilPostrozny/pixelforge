@@ -31,7 +31,7 @@ impl H264 {
         let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
-        let input_image_view = slot.input_image_view;
+        let input_image_view = common.pipeline.slot(plan.source_slot).input_image_view;
 
         debug!(
             "h264 record: frame_num={}, poc={}, is_idr={}, refs_len={}, cur_slot={}",
