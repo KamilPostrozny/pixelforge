@@ -48,7 +48,7 @@ use crate::encoder::resources::{
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
-use crate::video::{SlotSync, TimelineChain};
+use crate::video::{HostAccess, SlotSync, TimelineChain};
 use crate::vulkan::VideoContext;
 
 /// A handle to the packet a single `EncodePipeline::submit_current` will
@@ -236,6 +236,7 @@ impl EncodePipeline {
                 config.bitstream_buffer_size,
                 vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR,
                 config.profile_info,
+                HostAccess::Readback,
             )?;
             let bitstream_buffer_ptr = map_bitstream_buffer(
                 context,

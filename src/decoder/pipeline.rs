@@ -49,8 +49,8 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use crate::decoder::DecodedFrame;
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
-    SlotSync, TimelineChain, allocate_command_buffers, create_bitstream_buffer, create_fence,
-    map_bitstream_buffer,
+    HostAccess, SlotSync, TimelineChain, allocate_command_buffers, create_bitstream_buffer,
+    create_fence, map_bitstream_buffer,
 };
 use crate::vulkan::VideoContext;
 
@@ -227,6 +227,7 @@ impl DecodePipeline {
             new_size,
             vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
             profile_info,
+            HostAccess::Upload,
         )?;
         slot.bitstream_ptr = map_bitstream_buffer(context, memory, new_size)?;
         slot.bitstream_buffer = buffer;
