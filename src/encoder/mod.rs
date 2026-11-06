@@ -592,6 +592,7 @@ pub struct EncodedPacket {
 /// behind a single boxed pointer instead of an enum that re-dispatches by hand.
 trait EncoderApi: Send {
     fn input_image(&self) -> vk::Image;
+    fn readback_thread_id(&self) -> Option<u32>;
     fn encode_after(
         &mut self,
         src_image: vk::Image,
@@ -606,6 +607,9 @@ trait EncoderApi: Send {
 impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     fn input_image(&self) -> vk::Image {
         codec::CodecEncoder::input_image(self)
+    }
+    fn readback_thread_id(&self) -> Option<u32> {
+        codec::CodecEncoder::readback_thread_id(self)
     }
     fn encode_after(
         &mut self,
@@ -652,6 +656,15 @@ impl Encoder {
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
         self.0.input_image()
+    }
+
+    /// The Linux thread ID of the encoder's readback thread, which waits for
+    /// each frame's encode and reads its bitstream back to resolve the
+    /// [`EncodeFuture`]. Every frame passes through it, so a caller that runs
+    /// its own frame path at a real-time priority can give this thread the
+    /// same. `None` off Linux or when `/proc/thread-self` couldn't be read.
+    pub fn readback_thread_id(&self) -> Option<u32> {
+        self.0.readback_thread_id()
     }
 
     /// Encode a frame from a GPU image.
