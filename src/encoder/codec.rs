@@ -450,6 +450,8 @@ pub(crate) struct CommonInitRequest<'a> {
     /// Whether the codec can use a layered DPB image when the driver lacks
     /// `SEPARATE_REFERENCE_IMAGES` (H.264/H.265 yes; AV1 no).
     pub allow_layered_dpb: bool,
+    /// The device's `maxQualityLevels` for this profile.
+    pub max_quality_levels: u32,
 }
 
 /// Result of [`build_encoder_common`]: the assembled common state plus the
@@ -522,6 +524,16 @@ pub(crate) fn query_video_caps(
     })
 }
 
+/// Reject a quality level the device doesn't offer for this profile.
+pub(crate) fn check_encode_quality_level(level: u32, max_quality_levels: u32) -> Result<()> {
+    if level >= max_quality_levels {
+        return Err(PixelForgeError::InvalidInput(format!(
+            "encode quality level {level} not supported: device offers {max_quality_levels}"
+        )));
+    }
+    Ok(())
+}
+
 /// Query capabilities, create the video session, DPB images, command resources,
 /// the encode pipeline and the GOP structure — the ~85% of encoder
 /// initialization that is identical across codecs.
@@ -538,6 +550,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     // Capabilities were queried by the codec (which chains its codec-specific
     // capability struct, required by the driver) via [`query_video_caps`].
     let capabilities = req.caps;
+    check_encode_quality_level(config.encode_quality_level, req.max_quality_levels)?;
 
     // Align the coded extent to lcm(codec block size, device granularity), then
     // clamp up to the device minimum and re-align.
@@ -777,4 +790,17 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         reference_window: reference_window as u32,
         active_reference_count: max_active_reference_pictures as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_level_must_be_below_the_device_maximum() {
+        assert!(check_encode_quality_level(0, 1).is_ok());
+        assert!(check_encode_quality_level(1, 2).is_ok());
+        assert!(check_encode_quality_level(2, 2).is_err());
+        assert!(check_encode_quality_level(0, 0).is_err());
+    }
 }

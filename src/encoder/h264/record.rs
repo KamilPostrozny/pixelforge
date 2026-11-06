@@ -499,8 +499,8 @@ impl H264 {
         // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command on the first
         // frame (matches FFmpeg; required for AMD RADV).
         if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(common.config.encode_quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET

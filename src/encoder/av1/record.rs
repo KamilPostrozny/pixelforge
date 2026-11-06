@@ -360,8 +360,8 @@ impl Av1 {
         }
 
         if should_reset_coding_state {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(common.config.encode_quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET

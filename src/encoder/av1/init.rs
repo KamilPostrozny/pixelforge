@@ -84,6 +84,7 @@ impl Av1 {
             // Allow the shared infrastructure to fall back to a layered DPB
             // when the driver does not support separate reference images
             // (required for AMD RADV).
+            max_quality_levels: encode_caps.max_quality_levels,
             allow_layered_dpb: true,
         })?;
         let reference_window = init.reference_window;

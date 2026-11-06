@@ -354,6 +354,10 @@ pub struct EncodeConfig {
     pub encode_content_hint: EncodeContentHint,
     /// Encoder tuning mode.
     pub encoder_tuning_mode: EncoderTuningMode,
+    /// Vulkan video encode quality level (`VkVideoEncodeQualityLevelInfoKHR`):
+    /// 0 is the driver's fastest preset, higher levels trade encode time for
+    /// picture quality. Must be below the device's `maxQualityLevels`.
+    pub encode_quality_level: u32,
 }
 
 impl EncodeConfig {
@@ -382,6 +386,7 @@ impl EncodeConfig {
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
+            encode_quality_level: 0,
         }
     }
 
@@ -410,6 +415,7 @@ impl EncodeConfig {
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
+            encode_quality_level: 0,
         }
     }
 
@@ -438,6 +444,7 @@ impl EncodeConfig {
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
+            encode_quality_level: 0,
         }
     }
 
@@ -539,6 +546,12 @@ impl EncodeConfig {
     /// Set the encoder tuning mode.
     pub fn with_encoder_tuning_mode(mut self, mode: EncoderTuningMode) -> Self {
         self.encoder_tuning_mode = mode;
+        self
+    }
+
+    /// Set the Vulkan video encode quality level (0 = fastest).
+    pub fn with_encode_quality_level(mut self, level: u32) -> Self {
+        self.encode_quality_level = level;
         self
     }
 }
@@ -758,6 +771,18 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_quality_level_defaults_to_fastest_and_is_settable() {
+        for config in [
+            EncodeConfig::h264(1280, 720),
+            EncodeConfig::h265(1280, 720),
+            EncodeConfig::av1(1280, 720),
+        ] {
+            assert_eq!(config.encode_quality_level, 0);
+            assert_eq!(config.with_encode_quality_level(1).encode_quality_level, 1);
+        }
+    }
 
     // PixelFormat tests.
     mod pixel_format_tests {

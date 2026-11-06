@@ -83,6 +83,7 @@ impl H265 {
             max_reference_window: 15,
             max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
+            max_quality_levels: encode_caps.max_quality_levels,
             allow_layered_dpb: true,
         })?;
         let reference_window = init.reference_window;
