@@ -12,6 +12,7 @@
 //! the first the driver accepts, ending at the default, which needs no
 //! privilege.
 
+use super::has_extension;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use std::ffi::CStr;
@@ -67,11 +68,7 @@ impl fmt::Display for QueueGlobalPriority {
 /// they support. `None` when the device has neither the KHR nor the EXT
 /// extension.
 pub(super) fn extension(extensions: &[vk::ExtensionProperties]) -> Option<(&'static CStr, bool)> {
-    let has = |name: &CStr| {
-        extensions
-            .iter()
-            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
-    };
+    let has = |name: &CStr| has_extension(extensions, name);
     if has(ash::khr::global_priority::NAME) {
         Some((ash::khr::global_priority::NAME, true))
     } else if has(ash::ext::global_priority::NAME) {

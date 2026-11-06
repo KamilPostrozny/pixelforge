@@ -412,7 +412,7 @@ struct ScannedFamilies {
 }
 
 /// Find a family with the `video` flag, a transfer family and a compute family
-/// on `physical_device`, the same way [`VideoContext::new`] does.
+/// on `physical_device`, the same way [`probe_physical_device`] does.
 ///
 /// The transfer family is picked by preference rather than last-wins: a family
 /// that also does video is the worst choice, since it contends with the
@@ -478,7 +478,7 @@ fn scan_queue_families(
 /// Select the decode / transfer / compute queue families on `physical_device`,
 /// failing if it cannot decode the required codecs.
 ///
-/// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
+/// Mirrors the selection [`probe_physical_device`] does, but scoped to the
 /// decode path: a video-decode family, a transfer family (preferring a
 /// dedicated engine over one that also does video — see the scoring), and a
 /// compute family (see [`find_compute_queue_family`]).
@@ -535,10 +535,15 @@ impl DeviceExtensions {
     }
 
     pub(super) fn has(&self, name: &CStr) -> bool {
-        self.0
-            .iter()
-            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+        has_extension(&self.0, name)
     }
+}
+
+/// Whether `extensions` (instance or device) lists `name`.
+fn has_extension(extensions: &[vk::ExtensionProperties], name: &CStr) -> bool {
+    extensions
+        .iter()
+        .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
 }
 
 /// Whether `physical_device` can support unified image layouts *for video*.
@@ -648,8 +653,11 @@ struct VideoContextInner {
     retired_semaphores: std::sync::Mutex<Vec<vk::Semaphore>>,
     /// Validation message sink, present only when validation is enabled and the
     /// instance is ours. Destroyed before the instance it belongs to.
-    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    debug_messenger: Option<DebugMessenger>,
 }
+
+/// The validation layer's messenger and the instance functions that destroy it.
+type DebugMessenger = (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT);
 
 impl Drop for VideoContextInner {
     fn drop(&mut self) {
@@ -802,602 +810,654 @@ impl VideoContext {
     }
 }
 
+/// Create the instance for a context that creates its own device, with the
+/// validation layer when `builder` asks for it and the layer is installed.
+/// Also returns whether `VK_EXT_debug_utils` was enabled, for the layer to
+/// report through.
+fn create_instance(
+    entry: &ash::Entry,
+    builder: &VideoContextBuilder,
+) -> Result<(ash::Instance, bool)> {
+    let app_name = CString::new(builder.app_name.clone()).expect("Invalid app name");
+    let engine_name = CString::new("PixelForge").expect("Invalid engine name");
+
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .application_version(vk::make_api_version(
+            0,
+            builder.app_version.0,
+            builder.app_version.1,
+            builder.app_version.2,
+        ))
+        .engine_name(&engine_name)
+        .engine_version(vk::make_api_version(0, 1, 0, 0))
+        .api_version(vk::API_VERSION_1_3);
+
+    let mut enable_validation = builder.enable_validation;
+    if enable_validation {
+        let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
+            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+        let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+        let has_validation_layer = available_layers.iter().any(|layer| {
+            let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+            name == validation_layer_name
+        });
+        if !has_validation_layer {
+            warn!("Validation layer requested but not available");
+            enable_validation = false;
+        }
+    }
+
+    let mut layer_names: Vec<*const c_char> = Vec::new();
+    let validation_layer = c"VK_LAYER_KHRONOS_validation";
+    if enable_validation {
+        layer_names.push(validation_layer.as_ptr());
+    }
+
+    // Enable VK_EXT_validation_features if validation is enabled to allow configuration.
+    let mut instance_extensions: Vec<*const c_char> = Vec::new();
+    if enable_validation {
+        let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+        let available_exts =
+            unsafe { entry.enumerate_instance_extension_properties(Some(validation_layer_name)) }
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+        let validation_features_name = c"VK_EXT_validation_features";
+        let has_validation_features = has_extension(&available_exts, validation_features_name);
+        if has_validation_features {
+            instance_extensions.push(validation_features_name.as_ptr());
+        } else {
+            warn!("VK_EXT_validation_features requested but not available");
+        }
+    }
+
+    // VK_EXT_debug_utils carries the messenger the layer reports through.
+    let mut has_debug_utils = false;
+    if enable_validation {
+        let available_exts = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+        has_debug_utils = has_extension(&available_exts, ash::ext::debug_utils::NAME);
+        if has_debug_utils {
+            instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+        } else {
+            warn!(
+                "VK_EXT_debug_utils not available; validation layer messages will not be \
+                 reported"
+            );
+        }
+    }
+
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_layer_names(&layer_names)
+        .enabled_extension_names(&instance_extensions);
+
+    let instance = unsafe { entry.create_instance(&create_info, None) }
+        .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+
+    info!("Created Vulkan instance");
+    Ok((instance, has_debug_utils))
+}
+
+/// Route the validation layer's messages on `instance` into `tracing`.
+fn create_debug_messenger(entry: &ash::Entry, instance: &ash::Instance) -> Result<DebugMessenger> {
+    let debug_utils = ash::ext::debug_utils::Instance::load(entry, instance);
+    let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+        .message_severity(
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+        )
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .pfn_user_callback(Some(debug_utils_callback));
+    let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
+        .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+    info!("Validation layer messages are routed to tracing");
+    Ok((debug_utils, messenger))
+}
+
+/// The physical device a context that creates its own device runs on, with
+/// the queue families and codecs found there.
+struct SelectedDevice {
+    physical_device: vk::PhysicalDevice,
+    extensions: Vec<vk::ExtensionProperties>,
+    video_encode_queue_family: Option<u32>,
+    video_encode_timestamp_valid_bits: u32,
+    video_decode_queue_family: Option<u32>,
+    transfer_queue_family: u32,
+    compute_queue_family: u32,
+    supported_encode_codecs: Vec<Codec>,
+    supported_decode_codecs: Vec<Codec>,
+}
+
+/// The first physical device with a video queue, a compute queue and every
+/// codec `builder` requires.
+fn select_physical_device(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    builder: &VideoContextBuilder,
+) -> Result<SelectedDevice> {
+    let physical_devices = unsafe { instance.enumerate_physical_devices() }
+        .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
+    let selected = physical_devices
+        .into_iter()
+        .find_map(|device| probe_physical_device(entry, instance, builder, device));
+    selected.ok_or_else(|| {
+        PixelForgeError::NoSuitableDevice(
+            "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
+        )
+    })
+}
+
+/// `physical_device`'s queue families and codecs, or `None` (after logging
+/// why) when it lacks something `builder` requires.
+fn probe_physical_device(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    builder: &VideoContextBuilder,
+    physical_device: vk::PhysicalDevice,
+) -> Option<SelectedDevice> {
+    let props = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
+        .to_string_lossy()
+        .to_string();
+    debug!("Checking device: {}", device_name);
+
+    let queue_families =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+    // Find queue families.
+    let mut encode_queue = None;
+    let mut encode_ts_bits = 0u32;
+    let mut decode_queue = None;
+    let mut transfer_q = u32::MAX;
+    let mut transfer_score = -1i32;
+    let compute_q = find_compute_queue_family(&queue_families).unwrap_or(u32::MAX);
+
+    for (idx, props) in queue_families.iter().enumerate() {
+        debug!(
+            "Queue family {}: flags={:?}, count={}",
+            idx, props.queue_flags, props.queue_count
+        );
+        let flags = props.queue_flags;
+
+        // Check for video encode queue.
+        if flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
+            encode_queue = Some(idx as u32);
+            encode_ts_bits = props.timestamp_valid_bits;
+            debug!("Found video encode queue at family {}", idx);
+        }
+
+        // Check for video decode queue.
+        if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) {
+            decode_queue = Some(idx as u32);
+            debug!("Found video decode queue at family {}", idx);
+        }
+
+        // Pick the transfer queue by preference, not by last-wins. The
+        // readback copy runs here, so a family that also does video
+        // (encode or decode) is the worst choice: it contends with our
+        // own encode/decode work and, on some drivers, shares a single
+        // VkQueue that would then need external synchronization. Among
+        // the rest, prefer the least capable family: a dedicated DMA
+        // engine first, then compute+transfer, and only then the
+        // graphics queue (which a downstream app typically drives for
+        // rendering and present).
+        if flags.contains(vk::QueueFlags::TRANSFER) {
+            let is_video = flags
+                .intersects(vk::QueueFlags::VIDEO_ENCODE_KHR | vk::QueueFlags::VIDEO_DECODE_KHR);
+            let score = if is_video {
+                0 // shares a video engine; last resort
+            } else if flags.contains(vk::QueueFlags::GRAPHICS) {
+                1 // the universal graphics queue
+            } else if flags.contains(vk::QueueFlags::COMPUTE) {
+                2 // compute + transfer
+            } else {
+                3 // dedicated transfer engine
+            };
+            if score > transfer_score {
+                transfer_score = score;
+                transfer_q = idx as u32;
+            }
+        }
+    }
+    if compute_q != u32::MAX {
+        debug!("Found compute queue at family {}", compute_q);
+    }
+
+    // Get list of available device extensions
+    let available_extensions =
+        match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+            Ok(exts) => exts,
+            Err(e) => {
+                warn!(
+                    "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                    device_name, e
+                );
+                return None;
+            }
+        };
+
+    // Check codec support for encoding.
+    let mut encode_codecs = Vec::new();
+    if let Some(eq) = encode_queue {
+        // Only check codec support if the extension exists
+        if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
+            && VideoContext::check_h264_encode_support(entry, instance, physical_device, eq)
+        {
+            encode_codecs.push(Codec::H264);
+            debug!("Device {} supports H.264 encode", device_name);
+        }
+        if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
+            && VideoContext::check_h265_encode_support(entry, instance, physical_device, eq)
+        {
+            encode_codecs.push(Codec::H265);
+            debug!("Device {} supports H.265 encode", device_name);
+        }
+        if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
+            && VideoContext::check_av1_encode_support(entry, instance, physical_device, eq)
+        {
+            encode_codecs.push(Codec::AV1);
+            debug!("Device {} supports AV1 encode", device_name);
+        }
+    }
+
+    // Check codec support for decoding.
+    let mut decode_codecs = Vec::new();
+    if decode_queue.is_some()
+        && has_extension(&available_extensions, ash::khr::video_decode_h264::NAME)
+        && VideoContext::check_h264_decode_support(entry, instance, physical_device)
+    {
+        decode_codecs.push(Codec::H264);
+        debug!("Device {} supports H.264 decode", device_name);
+    }
+
+    // Check if all required encode/decode codecs are supported.
+    let encode_supported = builder
+        .required_encode_codecs
+        .iter()
+        .all(|codec| encode_codecs.contains(codec));
+    let decode_supported = builder
+        .required_decode_codecs
+        .iter()
+        .all(|codec| decode_codecs.contains(codec));
+
+    // We need at least one video queue, and compute support.
+    let has_video_support = encode_queue.is_some() || decode_queue.is_some();
+    let has_compute_support = compute_q != u32::MAX;
+
+    if has_video_support && encode_supported && decode_supported && has_compute_support {
+        info!("Selected device: {}", device_name);
+        Some(SelectedDevice {
+            physical_device,
+            extensions: available_extensions,
+            video_encode_queue_family: encode_queue,
+            video_encode_timestamp_valid_bits: encode_ts_bits,
+            video_decode_queue_family: decode_queue,
+            transfer_queue_family: if transfer_q != u32::MAX {
+                transfer_q
+            } else {
+                encode_queue.unwrap_or(0)
+            },
+            compute_queue_family: compute_q,
+            supported_encode_codecs: encode_codecs,
+            supported_decode_codecs: decode_codecs,
+        })
+    } else {
+        warn!(
+            "Device {} skipped: video_support={}, encode_supported={}, decode_supported={}, compute_support={}",
+            device_name, has_video_support, encode_supported, decode_supported, has_compute_support
+        );
+        if !has_video_support {
+            warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
+        }
+        if !encode_supported {
+            warn!(
+                "  - Required encode codecs not supported: {:?}",
+                builder.required_encode_codecs
+            );
+            warn!("  - Available encode codecs: {:?}", encode_codecs);
+        }
+        if !decode_supported {
+            warn!(
+                "  - Required decode codecs not supported: {:?}",
+                builder.required_decode_codecs
+            );
+            warn!("  - Available decode codecs: {:?}", decode_codecs);
+        }
+        None
+    }
+}
+
+/// The queue families to create queues in, each once.
+fn unique_queue_families(selected: &SelectedDevice) -> Vec<u32> {
+    let mut unique_families = Vec::new();
+    if let Some(encode_family) = selected.video_encode_queue_family {
+        unique_families.push(encode_family);
+    }
+    if let Some(decode_family) = selected.video_decode_queue_family
+        && !unique_families.contains(&decode_family)
+    {
+        unique_families.push(decode_family);
+    }
+    if !unique_families.contains(&selected.transfer_queue_family) {
+        unique_families.push(selected.transfer_queue_family);
+    }
+    if !unique_families.contains(&selected.compute_queue_family) {
+        unique_families.push(selected.compute_queue_family);
+    }
+    unique_families
+}
+
+/// The extensions and features a context that creates its own device enables
+/// on it.
+struct DeviceSetup {
+    extension_names: Vec<*const c_char>,
+    has_push_descriptor: bool,
+    /// The global priority extension enabled, and whether its queue families
+    /// can be asked what they support. `None` when not asked for or absent.
+    global_priority: Option<(&'static CStr, bool)>,
+    has_unified_layouts: bool,
+    has_ycbcr_conversion: bool,
+    has_ycbcr_2plane_444_ext: bool,
+    has_av1_encode: bool,
+}
+
+/// Decide which extensions and features to enable on `selected`, failing
+/// when a feature pixelforge cannot do without is missing.
+fn device_setup(
+    instance: &ash::Instance,
+    selected: &SelectedDevice,
+    builder: &VideoContextBuilder,
+) -> Result<DeviceSetup> {
+    // Required device extensions for video encoding.
+    let mut extension_names = vec![
+        ash::khr::video_queue::NAME.as_ptr(),
+        ash::khr::synchronization2::NAME.as_ptr(),
+    ];
+
+    // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
+    #[cfg(feature = "dmabuf")]
+    {
+        extension_names.push(ash::khr::external_memory::NAME.as_ptr());
+        extension_names.push(ash::khr::external_memory_fd::NAME.as_ptr());
+        extension_names.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+        extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
+    }
+
+    let mut push_ext = |name: *const std::ffi::c_char| {
+        if !extension_names.contains(&name) {
+            extension_names.push(name);
+        }
+    };
+    if selected.video_encode_queue_family.is_some() {
+        push_ext(ash::khr::video_encode_queue::NAME.as_ptr());
+
+        if selected.supported_encode_codecs.contains(&Codec::H264) {
+            push_ext(ash::khr::video_encode_h264::NAME.as_ptr());
+        }
+        if selected.supported_encode_codecs.contains(&Codec::H265) {
+            push_ext(ash::khr::video_encode_h265::NAME.as_ptr());
+        }
+        if selected.supported_encode_codecs.contains(&Codec::AV1) {
+            push_ext(ash::khr::video_encode_av1::NAME.as_ptr());
+        }
+    }
+    if selected.video_decode_queue_family.is_some() && !selected.supported_decode_codecs.is_empty()
+    {
+        push_ext(ash::khr::video_decode_queue::NAME.as_ptr());
+
+        if selected.supported_decode_codecs.contains(&Codec::H264) {
+            push_ext(ash::khr::video_decode_h264::NAME.as_ptr());
+        }
+    }
+
+    // The colour converter binds its two descriptors with push descriptors.
+    let has_push_descriptor = has_extension(&selected.extensions, ash::khr::push_descriptor::NAME);
+    if has_push_descriptor {
+        push_ext(ash::khr::push_descriptor::NAME.as_ptr());
+    } else {
+        warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
+    }
+
+    // Global queue priority, only when asked for: the extension to enable,
+    // and whether its queue families can be asked what they support.
+    let global_priority = if builder.highest_queue_priority {
+        let found = priority::extension(&selected.extensions);
+        match found {
+            Some((name, _)) => push_ext(name.as_ptr()),
+            None => {
+                warn!("VK_KHR_global_priority not available; queues keep the default priority")
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    // VK_KHR_unified_image_layouts: makes VK_IMAGE_LAYOUT_GENERAL valid
+    // everywhere, and its `video` bit extends that to video picture
+    // resources. Both bits are what let a decoded picture be sampled
+    // without ever being transitioned out of the layout the decoder needs.
+    let has_unified_layouts_ext =
+        has_extension(&selected.extensions, ash::khr::unified_image_layouts::NAME);
+    let mut supported_unified_layouts = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
+    if has_unified_layouts_ext {
+        let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut supported_unified_layouts);
+        unsafe {
+            instance.get_physical_device_features2(selected.physical_device, &mut query);
+        }
+    }
+    let has_unified_layouts = builder.unified_image_layouts != Some(false)
+        && has_unified_layouts_ext
+        && supported_unified_layouts.unified_image_layouts != 0
+        && supported_unified_layouts.unified_image_layouts_video != 0;
+    if has_unified_layouts {
+        debug!("Unified image layouts enabled: decoded frames need no copy to be read");
+    } else {
+        debug!(
+            "Unified image layouts unavailable (extension {}, unifiedImageLayouts {}, \
+             unifiedImageLayoutsVideo {}); decoded frames will be copied out",
+            has_unified_layouts_ext,
+            supported_unified_layouts.unified_image_layouts,
+            supported_unified_layouts.unified_image_layouts_video
+        );
+    }
+    if has_unified_layouts {
+        push_ext(ash::khr::unified_image_layouts::NAME.as_ptr());
+    }
+
+    let mut supported_timeline_features = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+    let mut timeline_feature_query =
+        vk::PhysicalDeviceFeatures2::default().push(&mut supported_timeline_features);
+    unsafe {
+        instance
+            .get_physical_device_features2(selected.physical_device, &mut timeline_feature_query);
+    }
+    if supported_timeline_features.timeline_semaphore == 0 {
+        return Err(PixelForgeError::NoSuitableDevice(
+            "Timeline semaphores are required for pipelined video encode synchronization"
+                .to_string(),
+        ));
+    }
+
+    // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
+    let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+    let mut ycbcr_query = vk::PhysicalDeviceFeatures2::default().push(&mut supported_ycbcr);
+    unsafe {
+        instance.get_physical_device_features2(selected.physical_device, &mut ycbcr_query);
+    }
+    let has_ycbcr_conversion = supported_ycbcr.sampler_ycbcr_conversion != 0;
+
+    let has_ycbcr_2plane_444_ext = has_extension(
+        &selected.extensions,
+        ash::ext::ycbcr_2plane_444_formats::NAME,
+    );
+
+    if has_ycbcr_2plane_444_ext {
+        // Add the 2-plane 444 formats extension.
+        push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
+    }
+
+    // Log all extensions being enabled
+    debug!("Enabling {} device extensions:", extension_names.len());
+    for ext_name_ptr in &extension_names {
+        let ext_name = unsafe { std::ffi::CStr::from_ptr(*ext_name_ptr) };
+        debug!("  - {}", ext_name.to_string_lossy());
+    }
+
+    Ok(DeviceSetup {
+        extension_names,
+        has_push_descriptor,
+        global_priority,
+        has_unified_layouts,
+        has_ycbcr_conversion,
+        has_ycbcr_2plane_444_ext,
+        has_av1_encode: selected.supported_encode_codecs.contains(&Codec::AV1),
+    })
+}
+
+/// Create the device with `setup`'s extensions and features and one queue in
+/// each of `families`, at `global_priority` when given.
+///
+/// Called once per priority tried, and each call builds its own feature
+/// structs, since `push` links them into one create info's chain.
+fn create_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    families: &[u32],
+    setup: &DeviceSetup,
+    global_priority: Option<vk::QueueGlobalPriority>,
+) -> std::result::Result<ash::Device, vk::Result> {
+    let queue_priorities = [1.0f32];
+    let mut global_priorities =
+        vec![
+            vk::DeviceQueueGlobalPriorityCreateInfo::default()
+                .global_priority(global_priority.unwrap_or(vk::QueueGlobalPriority::MEDIUM));
+            families.len()
+        ];
+    let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = families
+        .iter()
+        .zip(&mut global_priorities)
+        .map(|(&family, global)| {
+            let info = vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(family)
+                .queue_priorities(&queue_priorities);
+            if global_priority.is_some() {
+                info.push(global)
+            } else {
+                info
+            }
+        })
+        .collect();
+
+    let mut sync2_features =
+        vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut timeline_features =
+        vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+    let mut unified_layout_features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
+        .unified_image_layouts(true)
+        .unified_image_layouts_video(true);
+    let mut av1_encode_features =
+        vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
+    let mut ycbcr_features =
+        vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default().sampler_ycbcr_conversion(true);
+    let mut ycbcr_2plane_444_features =
+        vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default().ycbcr2plane444_formats(true);
+    let mut device_create_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_create_infos)
+        .enabled_extension_names(&setup.extension_names)
+        .push(&mut sync2_features)
+        .push(&mut timeline_features);
+
+    if setup.has_unified_layouts {
+        device_create_info = device_create_info.push(&mut unified_layout_features);
+    }
+
+    // Only include AV1 features in the pNext chain when AV1 is actually supported,
+    // to avoid chaining unknown feature structs on devices without AV1.
+    if setup.has_av1_encode {
+        device_create_info = device_create_info.push(&mut av1_encode_features);
+    }
+
+    if setup.has_ycbcr_conversion {
+        device_create_info = device_create_info.push(&mut ycbcr_features);
+    }
+    // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+    // Its extension is enabled whenever present (see `device_setup`), so the
+    // feature has to follow it unconditionally: an extension without its
+    // feature bit leaves the 4:4:4 formats unusable.
+    if setup.has_ycbcr_2plane_444_ext {
+        device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
+    }
+
+    unsafe { instance.create_device(physical_device, &device_create_info, None) }
+}
+
 impl VideoContext {
     fn new(builder: VideoContextBuilder) -> Result<Self> {
         // Load Vulkan.
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
 
-        // Create instance.
-        let app_name = CString::new(builder.app_name.clone()).expect("Invalid app name");
-        let engine_name = CString::new("PixelForge").expect("Invalid engine name");
-
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .application_version(vk::make_api_version(
-                0,
-                builder.app_version.0,
-                builder.app_version.1,
-                builder.app_version.2,
-            ))
-            .engine_name(&engine_name)
-            .engine_version(vk::make_api_version(0, 1, 0, 0))
-            .api_version(vk::API_VERSION_1_3);
-
-        let mut enable_validation = builder.enable_validation;
-        if enable_validation {
-            let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
-                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
-            let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
-            let has_validation_layer = available_layers.iter().any(|layer| {
-                let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
-                name == validation_layer_name
-            });
-            if !has_validation_layer {
-                warn!("Validation layer requested but not available");
-                enable_validation = false;
-            }
-        }
-
-        let mut layer_names: Vec<*const c_char> = Vec::new();
-        let validation_layer = c"VK_LAYER_KHRONOS_validation";
-        if enable_validation {
-            layer_names.push(validation_layer.as_ptr());
-        }
-
-        // Enable VK_EXT_validation_features if validation is enabled to allow configuration.
-        let mut instance_extensions: Vec<*const c_char> = Vec::new();
-        if enable_validation {
-            let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
-            let available_exts = unsafe {
-                entry.enumerate_instance_extension_properties(Some(validation_layer_name))
-            }
-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
-            let validation_features_name = c"VK_EXT_validation_features";
-            let has_validation_features = available_exts.iter().any(|ext| {
-                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                name == validation_features_name
-            });
-            if has_validation_features {
-                instance_extensions.push(validation_features_name.as_ptr());
-            } else {
-                warn!("VK_EXT_validation_features requested but not available");
-            }
-        }
-
-        // VK_EXT_debug_utils carries the messenger the layer reports through.
-        let mut has_debug_utils = false;
-        if enable_validation {
-            let available_exts = unsafe { entry.enumerate_instance_extension_properties(None) }
-                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
-            has_debug_utils = available_exts.iter().any(|ext| {
-                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                name == ash::ext::debug_utils::NAME
-            });
-            if has_debug_utils {
-                instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-            } else {
-                warn!(
-                    "VK_EXT_debug_utils not available; validation layer messages will not be \
-                     reported"
-                );
-            }
-        }
-
-        let create_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_layer_names(&layer_names)
-            .enabled_extension_names(&instance_extensions);
-
-        let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
-
-        info!("Created Vulkan instance");
-
+        let (instance, has_debug_utils) = create_instance(&entry, &builder)?;
         let debug_messenger = if has_debug_utils {
-            let debug_utils = ash::ext::debug_utils::Instance::load(&entry, &instance);
-            let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(debug_utils_callback));
-            let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
-                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
-            info!("Validation layer messages are routed to tracing");
-            Some((debug_utils, messenger))
+            Some(create_debug_messenger(&entry, &instance)?)
         } else {
             None
         };
 
         // Find physical device with video support.
-        let physical_devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
-
-        let mut selected_device = None;
-        let mut selected_device_exts = None;
-        let mut video_encode_queue_family = None;
-        let mut video_encode_timestamp_valid_bits = 0u32;
-        let mut video_decode_queue_family = None;
-        let mut transfer_queue_family = u32::MAX;
-        let mut compute_queue_family = u32::MAX;
-        let mut supported_encode_codecs = Vec::new();
-        let mut supported_decode_codecs = Vec::new();
-
-        let has_extension =
-            |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
-                extensions.iter().any(|ext| {
-                    let ext_name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                    ext_name == name
-                })
-            };
-
-        for physical_device in physical_devices {
-            let props = unsafe { instance.get_physical_device_properties(physical_device) };
-            let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
-                .to_string_lossy()
-                .to_string();
-            debug!("Checking device: {}", device_name);
-
-            let queue_families =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-
-            // Find queue families.
-            let mut encode_queue = None;
-            let mut encode_ts_bits = 0u32;
-            let mut decode_queue = None;
-            let mut transfer_q = u32::MAX;
-            let mut transfer_score = -1i32;
-            let compute_q = find_compute_queue_family(&queue_families).unwrap_or(u32::MAX);
-
-            for (idx, props) in queue_families.iter().enumerate() {
-                debug!(
-                    "Queue family {}: flags={:?}, count={}",
-                    idx, props.queue_flags, props.queue_count
-                );
-                let flags = props.queue_flags;
-
-                // Check for video encode queue.
-                if flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
-                    encode_queue = Some(idx as u32);
-                    encode_ts_bits = props.timestamp_valid_bits;
-                    debug!("Found video encode queue at family {}", idx);
-                }
-
-                // Check for video decode queue.
-                if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) {
-                    decode_queue = Some(idx as u32);
-                    debug!("Found video decode queue at family {}", idx);
-                }
-
-                // Pick the transfer queue by preference, not by last-wins. The
-                // readback copy runs here, so a family that also does video
-                // (encode or decode) is the worst choice: it contends with our
-                // own encode/decode work and, on some drivers, shares a single
-                // VkQueue that would then need external synchronization. Among
-                // the rest, prefer the least capable family: a dedicated DMA
-                // engine first, then compute+transfer, and only then the
-                // graphics queue (which a downstream app typically drives for
-                // rendering and present).
-                if flags.contains(vk::QueueFlags::TRANSFER) {
-                    let is_video = flags.intersects(
-                        vk::QueueFlags::VIDEO_ENCODE_KHR | vk::QueueFlags::VIDEO_DECODE_KHR,
-                    );
-                    let score = if is_video {
-                        0 // shares a video engine; last resort
-                    } else if flags.contains(vk::QueueFlags::GRAPHICS) {
-                        1 // the universal graphics queue
-                    } else if flags.contains(vk::QueueFlags::COMPUTE) {
-                        2 // compute + transfer
-                    } else {
-                        3 // dedicated transfer engine
-                    };
-                    if score > transfer_score {
-                        transfer_score = score;
-                        transfer_q = idx as u32;
-                    }
-                }
-            }
-            if compute_q != u32::MAX {
-                debug!("Found compute queue at family {}", compute_q);
-            }
-
-            // Get list of available device extensions
-            let available_extensions = match unsafe {
-                instance.enumerate_device_extension_properties(physical_device)
-            } {
-                Ok(exts) => exts,
-                Err(e) => {
-                    warn!(
-                        "Failed to enumerate device extension properties for {}: {}. Skipping device.",
-                        device_name, e
-                    );
-                    continue;
-                }
-            };
-
-            // Check codec support for encoding.
-            let mut encode_codecs = Vec::new();
-            if let Some(eq) = encode_queue {
-                // Only check codec support if the extension exists
-                if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
-                    && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 encode", device_name);
-                }
-                if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
-                    && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::H265);
-                    debug!("Device {} supports H.265 encode", device_name);
-                }
-                if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
-                    && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::AV1);
-                    debug!("Device {} supports AV1 encode", device_name);
-                }
-            }
-
-            // Check codec support for decoding.
-            let mut decode_codecs = Vec::new();
-            if decode_queue.is_some() {
-                let available_extensions =
-                    unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                        .unwrap_or_default();
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
-                if has_extension(ash::khr::video_decode_h264::NAME)
-                    && Self::check_h264_decode_support(&entry, &instance, physical_device)
-                {
-                    decode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 decode", device_name);
-                }
-            }
-
-            // Check if all required encode/decode codecs are supported.
-            let encode_supported = builder
-                .required_encode_codecs
-                .iter()
-                .all(|codec| encode_codecs.contains(codec));
-            let decode_supported = builder
-                .required_decode_codecs
-                .iter()
-                .all(|codec| decode_codecs.contains(codec));
-
-            // We need at least one video queue, and compute support.
-            let has_video_support = encode_queue.is_some() || decode_queue.is_some();
-            let has_compute_support = compute_q != u32::MAX;
-
-            if has_video_support && encode_supported && decode_supported && has_compute_support {
-                selected_device = Some(physical_device);
-                selected_device_exts = Some(available_extensions);
-                video_encode_queue_family = encode_queue;
-                video_encode_timestamp_valid_bits = encode_ts_bits;
-                video_decode_queue_family = decode_queue;
-                transfer_queue_family = if transfer_q != u32::MAX {
-                    transfer_q
-                } else {
-                    encode_queue.unwrap_or(0)
-                };
-                compute_queue_family = compute_q;
-                supported_encode_codecs = encode_codecs;
-                supported_decode_codecs = decode_codecs;
-                info!("Selected device: {}", device_name);
-                break;
-            } else {
-                warn!(
-                    "Device {} skipped: video_support={}, encode_supported={}, decode_supported={}, compute_support={}",
-                    device_name,
-                    has_video_support,
-                    encode_supported,
-                    decode_supported,
-                    has_compute_support
-                );
-                if !has_video_support {
-                    warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
-                }
-                if !encode_supported {
-                    warn!(
-                        "  - Required encode codecs not supported: {:?}",
-                        builder.required_encode_codecs
-                    );
-                    warn!("  - Available encode codecs: {:?}", encode_codecs);
-                }
-                if !decode_supported {
-                    warn!(
-                        "  - Required decode codecs not supported: {:?}",
-                        builder.required_decode_codecs
-                    );
-                    warn!("  - Available decode codecs: {:?}", decode_codecs);
-                }
-            }
-        }
-
-        let physical_device = selected_device.ok_or_else(|| {
-            PixelForgeError::NoSuitableDevice(
-                "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
-            )
-        })?;
+        let selected = select_physical_device(&entry, &instance, &builder)?;
+        let physical_device = selected.physical_device;
 
         // Get device properties and memory properties.
         let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // Create logical device with video extensions: collect unique families.
-        let mut unique_families = Vec::new();
-        if let Some(encode_family) = video_encode_queue_family {
-            unique_families.push(encode_family);
-        }
-        if let Some(decode_family) = video_decode_queue_family
-            && !unique_families.contains(&decode_family)
-        {
-            unique_families.push(decode_family);
-        }
-        if !unique_families.contains(&transfer_queue_family) {
-            unique_families.push(transfer_queue_family);
-        }
-        if !unique_families.contains(&compute_queue_family) {
-            unique_families.push(compute_queue_family);
-        }
-
-        // Required device extensions for video encoding.
-        let mut extension_names = vec![
-            ash::khr::video_queue::NAME.as_ptr(),
-            ash::khr::synchronization2::NAME.as_ptr(),
-        ];
-
-        // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
-        #[cfg(feature = "dmabuf")]
-        {
-            extension_names.push(ash::khr::external_memory::NAME.as_ptr());
-            extension_names.push(ash::khr::external_memory_fd::NAME.as_ptr());
-            extension_names.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
-            extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
-        }
-
-        let mut push_ext = |name: *const std::ffi::c_char| {
-            if !extension_names.contains(&name) {
-                extension_names.push(name);
-            }
-        };
-        if video_encode_queue_family.is_some() {
-            push_ext(ash::khr::video_encode_queue::NAME.as_ptr());
-
-            if supported_encode_codecs.contains(&Codec::H264) {
-                push_ext(ash::khr::video_encode_h264::NAME.as_ptr());
-            }
-            if supported_encode_codecs.contains(&Codec::H265) {
-                push_ext(ash::khr::video_encode_h265::NAME.as_ptr());
-            }
-            if supported_encode_codecs.contains(&Codec::AV1) {
-                push_ext(ash::khr::video_encode_av1::NAME.as_ptr());
-            }
-        }
-        if video_decode_queue_family.is_some() && !supported_decode_codecs.is_empty() {
-            push_ext(ash::khr::video_decode_queue::NAME.as_ptr());
-
-            if supported_decode_codecs.contains(&Codec::H264) {
-                push_ext(ash::khr::video_decode_h264::NAME.as_ptr());
-            }
-        }
-
-        // The colour converter binds its two descriptors with push descriptors.
-        let has_push_descriptor = selected_device_exts
-            .as_ref()
-            .is_some_and(|exts| has_extension(exts, ash::khr::push_descriptor::NAME));
-        if has_push_descriptor {
-            push_ext(ash::khr::push_descriptor::NAME.as_ptr());
-        } else {
-            warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
-        }
-
-        // Global queue priority, only when asked for: the extension to enable,
-        // and whether its queue families can be asked what they support.
-        let global_priority = if builder.highest_queue_priority {
-            let found = selected_device_exts
-                .as_deref()
-                .and_then(priority::extension);
-            match found {
-                Some((name, _)) => push_ext(name.as_ptr()),
-                None => {
-                    warn!("VK_KHR_global_priority not available; queues keep the default priority")
-                }
-            }
-            found
-        } else {
-            None
-        };
-
-        // Enable synchronization2 feature.
-        let sync2_features =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-
-        // VK_KHR_unified_image_layouts: makes VK_IMAGE_LAYOUT_GENERAL valid
-        // everywhere, and its `video` bit extends that to video picture
-        // resources. Both bits are what let a decoded picture be sampled
-        // without ever being transitioned out of the layout the decoder needs.
-        let has_unified_layouts_ext = if let Some(device_exts) = &selected_device_exts {
-            has_extension(device_exts, ash::khr::unified_image_layouts::NAME)
-        } else {
-            false
-        };
-        let mut supported_unified_layouts =
-            vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default();
-        if has_unified_layouts_ext {
-            let mut query =
-                vk::PhysicalDeviceFeatures2::default().push(&mut supported_unified_layouts);
-            unsafe {
-                instance.get_physical_device_features2(physical_device, &mut query);
-            }
-        }
-        let has_unified_layouts = builder.unified_image_layouts != Some(false)
-            && has_unified_layouts_ext
-            && supported_unified_layouts.unified_image_layouts != 0
-            && supported_unified_layouts.unified_image_layouts_video != 0;
-        if has_unified_layouts {
-            debug!("Unified image layouts enabled: decoded frames need no copy to be read");
-        } else {
-            debug!(
-                "Unified image layouts unavailable (extension {}, unifiedImageLayouts {}, \
-                 unifiedImageLayoutsVideo {}); decoded frames will be copied out",
-                has_unified_layouts_ext,
-                supported_unified_layouts.unified_image_layouts,
-                supported_unified_layouts.unified_image_layouts_video
-            );
-        }
-        let unified_layout_features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
-            .unified_image_layouts(true)
-            .unified_image_layouts_video(true);
-        if has_unified_layouts {
-            push_ext(ash::khr::unified_image_layouts::NAME.as_ptr());
-        }
-
-        let mut supported_timeline_features =
-            vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-        let mut timeline_feature_query =
-            vk::PhysicalDeviceFeatures2::default().push(&mut supported_timeline_features);
-        unsafe {
-            instance.get_physical_device_features2(physical_device, &mut timeline_feature_query);
-        }
-        if supported_timeline_features.timeline_semaphore == 0 {
-            return Err(PixelForgeError::NoSuitableDevice(
-                "Timeline semaphores are required for pipelined video encode synchronization"
-                    .to_string(),
-            ));
-        }
-        let timeline_features =
-            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-
-        // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
-        let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-        let mut ycbcr_query = vk::PhysicalDeviceFeatures2::default().push(&mut supported_ycbcr);
-        unsafe {
-            instance.get_physical_device_features2(physical_device, &mut ycbcr_query);
-        }
-        let has_ycbcr_conversion = supported_ycbcr.sampler_ycbcr_conversion != 0;
-        let ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
-            .sampler_ycbcr_conversion(true);
-
-        let has_ycbcr_2plane_444_ext = if let Some(device_exts) = selected_device_exts {
-            has_extension(&device_exts, ash::ext::ycbcr_2plane_444_formats::NAME)
-        } else {
-            false
-        };
-
-        let ycbcr_2plane_444_features =
-            vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default()
-                .ycbcr2plane444_formats(true);
-
-        if has_ycbcr_2plane_444_ext {
-            // Add the 2-plane 444 formats extension.
-            push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
-        }
-
-        // Enable AV1 video encode feature only if AV1 is supported.
-        // Only include AV1 features in the pNext chain when AV1 is actually supported,
-        // to avoid chaining unknown feature structs on devices without AV1.
-        let av1_encode_features =
-            vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
-
-        // Log all extensions being enabled
-        debug!("Enabling {} device extensions:", extension_names.len());
-        for ext_name_ptr in &extension_names {
-            let ext_name = unsafe { std::ffi::CStr::from_ptr(*ext_name_ptr) };
-            debug!("  - {}", ext_name.to_string_lossy());
-        }
-
-        // Each attempt chains its own copies of the feature structs, since
-        // `push` links them into one create info's chain.
-        let create_device = |global_priority: Option<vk::QueueGlobalPriority>| {
-            let queue_priorities = [1.0f32];
-            let mut global_priorities = vec![
-                vk::DeviceQueueGlobalPriorityCreateInfo::default()
-                    .global_priority(
-                        global_priority.unwrap_or(vk::QueueGlobalPriority::MEDIUM)
-                    );
-                unique_families.len()
-            ];
-            let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
-                .iter()
-                .zip(&mut global_priorities)
-                .map(|(&family, global)| {
-                    let info = vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(family)
-                        .queue_priorities(&queue_priorities);
-                    if global_priority.is_some() {
-                        info.push(global)
-                    } else {
-                        info
-                    }
-                })
-                .collect();
-
-            let mut sync2_features = sync2_features;
-            let mut timeline_features = timeline_features;
-            let mut unified_layout_features = unified_layout_features;
-            let mut av1_encode_features = av1_encode_features;
-            let mut ycbcr_features = ycbcr_features;
-            let mut ycbcr_2plane_444_features = ycbcr_2plane_444_features;
-            let mut device_create_info = vk::DeviceCreateInfo::default()
-                .queue_create_infos(&queue_create_infos)
-                .enabled_extension_names(&extension_names)
-                .push(&mut sync2_features)
-                .push(&mut timeline_features);
-
-            if has_unified_layouts {
-                device_create_info = device_create_info.push(&mut unified_layout_features);
-            }
-
-            if supported_encode_codecs.contains(&Codec::AV1) {
-                device_create_info = device_create_info.push(&mut av1_encode_features);
-            }
-
-            if has_ycbcr_conversion {
-                device_create_info = device_create_info.push(&mut ycbcr_features);
-            }
-            // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
-            // Its extension is enabled above whenever present, so the feature has
-            // to follow it unconditionally: an extension without its feature bit
-            // leaves the 4:4:4 formats unusable.
-            if has_ycbcr_2plane_444_ext {
-                device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
-            }
-
-            unsafe { instance.create_device(physical_device, &device_create_info, None) }
-        };
-
-        let (device, queue_priority) = match global_priority {
+        // Create logical device with video extensions.
+        let unique_families = unique_queue_families(&selected);
+        let setup = device_setup(&instance, &selected, &builder)?;
+        let (device, queue_priority) = match setup.global_priority {
             Some((_, queryable)) => {
                 let supported = queryable.then(|| {
                     priority::supported_by_families(&instance, physical_device, &unique_families)
                 });
                 let candidates = priority::candidates(supported.as_deref());
-                let (device, granted) =
-                    priority::create_at_highest(&candidates, |p| create_device(Some(p)))
-                        .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
+                let (device, granted) = priority::create_at_highest(&candidates, |p| {
+                    create_device(
+                        &instance,
+                        physical_device,
+                        &unique_families,
+                        &setup,
+                        Some(p),
+                    )
+                })
+                .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
                 info!("Queues at global priority {granted} (tried {candidates:?})");
                 (device, Some(granted))
             }
             None => (
-                create_device(None).map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?,
+                create_device(&instance, physical_device, &unique_families, &setup, None)
+                    .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?,
                 None,
             ),
         };
+
+        let SelectedDevice {
+            video_encode_queue_family,
+            video_encode_timestamp_valid_bits,
+            video_decode_queue_family,
+            transfer_queue_family,
+            compute_queue_family,
+            supported_encode_codecs,
+            supported_decode_codecs,
+            ..
+        } = selected;
 
         // Get queues.
         let video_encode_queue =
@@ -1437,8 +1497,8 @@ impl VideoContext {
                 device_properties,
                 supported_encode_codecs,
                 supported_decode_codecs,
-                has_push_descriptor,
-                has_unified_image_layouts: has_unified_layouts,
+                has_push_descriptor: setup.has_push_descriptor,
+                has_unified_image_layouts: setup.has_unified_layouts,
                 queue_priority,
                 owns_device: true,
                 retired_semaphores: Default::default(),

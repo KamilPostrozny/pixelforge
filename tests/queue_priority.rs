@@ -8,7 +8,9 @@
 //! own rules, so on them the test checks only that the context works and that
 //! it reports a priority no lower than the default.
 //!
-//! Like `tests/context.rs`, it skips where no Vulkan driver is present.
+//! Ignored by default: both tests encode on a Vulkan Video device. Run with
+//! `cargo test --test queue_priority -- --ignored`. Like `tests/context.rs`,
+//! they skip where no Vulkan driver is present.
 
 #[allow(dead_code)]
 mod common;
@@ -82,6 +84,7 @@ fn encode_frames(context: &VideoContext) -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
+#[ignore = "requires a Vulkan Video device"]
 fn highest_queue_priority_gets_what_the_driver_grants() -> Result<(), Box<dyn std::error::Error>> {
     common::init_logging();
     let test = "highest_queue_priority_gets_what_the_driver_grants";
@@ -107,6 +110,7 @@ fn highest_queue_priority_gets_what_the_driver_grants() -> Result<(), Box<dyn st
 }
 
 #[test]
+#[ignore = "requires a Vulkan Video device"]
 fn a_context_not_asked_for_a_priority_reports_none() -> Result<(), Box<dyn std::error::Error>> {
     common::init_logging();
     let test = "a_context_not_asked_for_a_priority_reports_none";
