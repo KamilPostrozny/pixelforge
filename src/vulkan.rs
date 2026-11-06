@@ -8,7 +8,9 @@ use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
 mod encode_device;
+mod priority;
 mod queues;
+pub use priority::QueueGlobalPriority;
 use queues::QueueOverrides;
 pub use queues::{DeviceQueue, QueueRoles};
 
@@ -66,6 +68,8 @@ pub struct VideoContextBuilder {
     /// that adopts a caller's device assumes they were not enabled.
     unified_image_layouts: Option<bool>,
     queues: QueueOverrides,
+    /// Whether [`Self::build`] asks for the highest global queue priority.
+    highest_queue_priority: bool,
 }
 
 impl Default for VideoContextBuilder {
@@ -85,6 +89,7 @@ impl VideoContextBuilder {
             required_decode_codecs: Vec::new(),
             unified_image_layouts: None,
             queues: QueueOverrides::default(),
+            highest_queue_priority: false,
         }
     }
 
@@ -161,6 +166,21 @@ impl VideoContextBuilder {
     /// device. See [`Self::with_transfer_queue`]. Ignored by [`Self::build`].
     pub fn with_compute_queue(mut self, queue: DeviceQueue) -> Self {
         self.queues.compute = Some(queue);
+        self
+    }
+
+    /// Create every queue at the highest global priority the driver grants
+    /// (`VK_KHR_global_priority`), so this context's work runs ahead of other
+    /// processes' GPU work.
+    ///
+    /// Priorities above the default are a privilege: on Linux, amdgpu grants
+    /// them only to a process with `CAP_SYS_NICE`. A refused priority is not
+    /// an error; the context falls back to the next one down, ending at the
+    /// default, and [`VideoContext::queue_priority`] reports what it got.
+    /// Without the extension the queues keep the driver's default. Ignored by
+    /// the adopted-device builds, whose queues the caller created.
+    pub fn highest_queue_priority(mut self) -> Self {
+        self.highest_queue_priority = true;
         self
     }
 
@@ -615,6 +635,9 @@ struct VideoContextInner {
     supported_decode_codecs: Vec<Codec>,
     has_push_descriptor: bool,
     has_unified_image_layouts: bool,
+    /// What [`VideoContextBuilder::highest_queue_priority`] got, if it was
+    /// asked for and the device has global priorities.
+    queue_priority: Option<QueueGlobalPriority>,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
@@ -768,6 +791,14 @@ impl VideoContext {
     /// to be sampled, copied from, or used as a reference.
     pub fn has_unified_image_layouts(&self) -> bool {
         self.inner.has_unified_image_layouts
+    }
+
+    /// The global priority this context's queues were created at, when it was
+    /// built with [`VideoContextBuilder::highest_queue_priority`] on a device
+    /// with `VK_KHR_global_priority` (or the EXT). `None` otherwise: the
+    /// queues then have the driver's default priority.
+    pub fn queue_priority(&self) -> Option<QueueGlobalPriority> {
+        self.inner.queue_priority
     }
 }
 
@@ -1107,10 +1138,7 @@ impl VideoContext {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // Create logical device with video extensions.
-        let queue_priorities = [1.0f32];
-
-        // Build queue create infos - collect unique families.
+        // Create logical device with video extensions: collect unique families.
         let mut unique_families = Vec::new();
         if let Some(encode_family) = video_encode_queue_family {
             unique_families.push(encode_family);
@@ -1126,15 +1154,6 @@ impl VideoContext {
         if !unique_families.contains(&compute_queue_family) {
             unique_families.push(compute_queue_family);
         }
-
-        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
-            .iter()
-            .map(|&family| {
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family)
-                    .queue_priorities(&queue_priorities)
-            })
-            .collect();
 
         // Required device extensions for video encoding.
         let mut extension_names = vec![
@@ -1187,8 +1206,25 @@ impl VideoContext {
             warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
         }
 
+        // Global queue priority, only when asked for: the extension to enable,
+        // and whether its queue families can be asked what they support.
+        let global_priority = if builder.highest_queue_priority {
+            let found = selected_device_exts
+                .as_deref()
+                .and_then(priority::extension);
+            match found {
+                Some((name, _)) => push_ext(name.as_ptr()),
+                None => {
+                    warn!("VK_KHR_global_priority not available; queues keep the default priority")
+                }
+            }
+            found
+        } else {
+            None
+        };
+
         // Enable synchronization2 feature.
-        let mut sync2_features =
+        let sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
         // VK_KHR_unified_image_layouts: makes VK_IMAGE_LAYOUT_GENERAL valid
@@ -1224,10 +1260,9 @@ impl VideoContext {
                 supported_unified_layouts.unified_image_layouts_video
             );
         }
-        let mut unified_layout_features =
-            vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
-                .unified_image_layouts(true)
-                .unified_image_layouts_video(true);
+        let unified_layout_features = vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR::default()
+            .unified_image_layouts(true)
+            .unified_image_layouts_video(true);
         if has_unified_layouts {
             push_ext(ash::khr::unified_image_layouts::NAME.as_ptr());
         }
@@ -1245,7 +1280,7 @@ impl VideoContext {
                     .to_string(),
             ));
         }
-        let mut timeline_features =
+        let timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
 
         // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
@@ -1255,7 +1290,7 @@ impl VideoContext {
             instance.get_physical_device_features2(physical_device, &mut ycbcr_query);
         }
         let has_ycbcr_conversion = supported_ycbcr.sampler_ycbcr_conversion != 0;
-        let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+        let ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
 
         let has_ycbcr_2plane_444_ext = if let Some(device_exts) = selected_device_exts {
@@ -1264,7 +1299,7 @@ impl VideoContext {
             false
         };
 
-        let mut ycbcr_2plane_444_features =
+        let ycbcr_2plane_444_features =
             vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default()
                 .ycbcr2plane444_formats(true);
 
@@ -1276,7 +1311,7 @@ impl VideoContext {
         // Enable AV1 video encode feature only if AV1 is supported.
         // Only include AV1 features in the pNext chain when AV1 is actually supported,
         // to avoid chaining unknown feature structs on devices without AV1.
-        let mut av1_encode_features =
+        let av1_encode_features =
             vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
 
         // Log all extensions being enabled
@@ -1286,33 +1321,83 @@ impl VideoContext {
             debug!("  - {}", ext_name.to_string_lossy());
         }
 
-        let mut device_create_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&extension_names)
-            .push(&mut sync2_features)
-            .push(&mut timeline_features);
+        // Each attempt chains its own copies of the feature structs, since
+        // `push` links them into one create info's chain.
+        let create_device = |global_priority: Option<vk::QueueGlobalPriority>| {
+            let queue_priorities = [1.0f32];
+            let mut global_priorities = vec![
+                vk::DeviceQueueGlobalPriorityCreateInfo::default()
+                    .global_priority(
+                        global_priority.unwrap_or(vk::QueueGlobalPriority::MEDIUM)
+                    );
+                unique_families.len()
+            ];
+            let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
+                .iter()
+                .zip(&mut global_priorities)
+                .map(|(&family, global)| {
+                    let info = vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(family)
+                        .queue_priorities(&queue_priorities);
+                    if global_priority.is_some() {
+                        info.push(global)
+                    } else {
+                        info
+                    }
+                })
+                .collect();
 
-        if has_unified_layouts {
-            device_create_info = device_create_info.push(&mut unified_layout_features);
-        }
+            let mut sync2_features = sync2_features;
+            let mut timeline_features = timeline_features;
+            let mut unified_layout_features = unified_layout_features;
+            let mut av1_encode_features = av1_encode_features;
+            let mut ycbcr_features = ycbcr_features;
+            let mut ycbcr_2plane_444_features = ycbcr_2plane_444_features;
+            let mut device_create_info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_create_infos)
+                .enabled_extension_names(&extension_names)
+                .push(&mut sync2_features)
+                .push(&mut timeline_features);
 
-        if supported_encode_codecs.contains(&Codec::AV1) {
-            device_create_info = device_create_info.push(&mut av1_encode_features);
-        }
+            if has_unified_layouts {
+                device_create_info = device_create_info.push(&mut unified_layout_features);
+            }
 
-        if has_ycbcr_conversion {
-            device_create_info = device_create_info.push(&mut ycbcr_features);
-        }
-        // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
-        // Its extension is enabled above whenever present, so the feature has
-        // to follow it unconditionally: an extension without its feature bit
-        // leaves the 4:4:4 formats unusable.
-        if has_ycbcr_2plane_444_ext {
-            device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
-        }
+            if supported_encode_codecs.contains(&Codec::AV1) {
+                device_create_info = device_create_info.push(&mut av1_encode_features);
+            }
 
-        let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
+            if has_ycbcr_conversion {
+                device_create_info = device_create_info.push(&mut ycbcr_features);
+            }
+            // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+            // Its extension is enabled above whenever present, so the feature has
+            // to follow it unconditionally: an extension without its feature bit
+            // leaves the 4:4:4 formats unusable.
+            if has_ycbcr_2plane_444_ext {
+                device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
+            }
+
+            unsafe { instance.create_device(physical_device, &device_create_info, None) }
+        };
+
+        let (device, queue_priority) = match global_priority {
+            Some((_, queryable)) => {
+                let supported = queryable.then(|| {
+                    priority::supported_by_families(&instance, physical_device, &unique_families)
+                });
+                let candidates = priority::candidates(supported.as_deref());
+                let (device, granted) =
+                    priority::create_at_highest(&candidates, |p| create_device(Some(p)))
+                        .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
+                info!("Queues at global priority {granted} (tried {candidates:?})");
+                (device, Some(granted))
+            }
+            None => (
+                create_device(None).map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?,
+                None,
+            ),
+        };
 
         // Get queues.
         let video_encode_queue =
@@ -1354,6 +1439,7 @@ impl VideoContext {
                 supported_decode_codecs,
                 has_push_descriptor,
                 has_unified_image_layouts: has_unified_layouts,
+                queue_priority,
                 owns_device: true,
                 retired_semaphores: Default::default(),
                 debug_messenger,
@@ -1458,6 +1544,8 @@ impl VideoContext {
                 supported_decode_codecs,
                 has_push_descriptor: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
+                // The caller created the queues.
+                queue_priority: None,
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
