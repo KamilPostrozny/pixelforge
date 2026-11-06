@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `VideoContextBuilder::highest_queue_priority`, which creates the queues at the highest global priority the driver grants, and `VideoContext::queue_priority`.
 - Add `Encoder::repeat`: encode the last frame again from the encoder's own
   input image, for a key frame while no new frame arrives.
 
