@@ -11,7 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `VideoContextBuilder::highest_queue_priority`, which creates the queues at the highest global priority the driver grants, and `VideoContext::queue_priority`.
 - Add `Encoder::repeat`: encode the last frame again from the encoder's own
-  input image, for a key frame while no new frame arrives.
+  input image, for a key frame while no new frame arrives (backport of upstream 3dfc229).
+- Add `Encoder::readback_thread_id`, the Linux thread ID of the thread that waits for each encode and reads its bitstream back, so a caller running its frame path at a real-time priority can give that thread the same priority.
+
+### Fixed
+
+- Read the encoded bitstream back from host-cached memory where the driver offers it (`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`), falling back to the first `HOST_VISIBLE | HOST_COHERENT` type. On RADV the first fit is write-combined memory, which the CPU reads uncached: copying a frame out took ~190 µs at p50 on an RX 9070, against ~5 µs from cached memory.
 
 ## [0.10.0] - 19-10-2026
 
