@@ -327,11 +327,39 @@ pub(crate) fn find_memory_type(
     })
 }
 
+/// Pick the memory type for a buffer the GPU writes and the CPU reads back.
+///
+/// Prefers host-visible, coherent and cached memory: CPU reads from
+/// write-combined (uncached) memory bypass the cache and are slow. Falls back
+/// to the first host-visible, coherent type.
+pub(crate) fn find_readback_memory_type(
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+) -> Option<u32> {
+    let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    find_memory_type(
+        memory_props,
+        type_filter,
+        coherent | vk::MemoryPropertyFlags::HOST_CACHED,
+    )
+    .or_else(|| find_memory_type(memory_props, type_filter, coherent))
+}
+
+/// Which way a host-visible buffer's contents travel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostAccess {
+    /// The CPU writes and the GPU reads (decode input).
+    Upload,
+    /// The GPU writes and the CPU reads (encode output).
+    Readback,
+}
+
 pub(crate) fn create_bitstream_buffer(
     context: &VideoContext,
     size: usize,
     usage: vk::BufferUsageFlags,
     profile_info: &vk::VideoProfileInfoKHR,
+    host_access: HostAccess,
 ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
     let profiles = [*profile_info];
     let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
@@ -347,14 +375,23 @@ pub(crate) fn create_bitstream_buffer(
 
     let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
 
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
+    let memory_props = context.memory_properties();
+    let type_filter = mem_requirements.memory_type_bits;
+    let memory_type_index = match host_access {
+        HostAccess::Upload => find_memory_type(
+            memory_props,
+            type_filter,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ),
+        HostAccess::Readback => find_readback_memory_type(memory_props, type_filter),
+    }
     .ok_or_else(|| {
         PixelForgeError::MemoryAllocation("No suitable memory type for buffer".to_string())
     })?;
+    tracing::debug!(
+        "Bitstream buffer ({host_access:?}): memory type {memory_type_index} ({:?}) of allowed {type_filter:#x}",
+        memory_props.memory_types[memory_type_index as usize].property_flags,
+    );
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_requirements.size)
@@ -746,5 +783,76 @@ impl SlotSync {
     pub(crate) fn set_free(&self, index: usize) {
         self.busy.lock().unwrap()[index] = false;
         self.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEVICE_LOCAL: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    const HOST_VISIBLE: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    const HOST_COHERENT: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
+    const HOST_CACHED: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_CACHED;
+
+    fn memory_properties(types: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
+        for (slot, &flags) in props.memory_types.iter_mut().zip(types) {
+            slot.property_flags = flags;
+        }
+        props
+    }
+
+    /// The RX 9070 on RADV (Mesa 26.2): write-combined GTT (2) and BAR VRAM
+    /// (3, 4) come before cached GTT (5, 6).
+    fn radv_rx9070() -> vk::PhysicalDeviceMemoryProperties {
+        memory_properties(&[
+            DEVICE_LOCAL,
+            DEVICE_LOCAL,
+            HOST_VISIBLE | HOST_COHERENT,
+            DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT,
+            DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT,
+            HOST_VISIBLE | HOST_COHERENT | HOST_CACHED,
+            HOST_VISIBLE | HOST_COHERENT | HOST_CACHED,
+        ])
+    }
+
+    #[test]
+    fn readback_prefers_cached_memory_over_an_earlier_uncached_type() {
+        assert_eq!(find_readback_memory_type(&radv_rx9070(), 0x7f), Some(5));
+    }
+
+    #[test]
+    fn readback_takes_the_first_cached_type_the_buffer_allows() {
+        assert_eq!(
+            find_readback_memory_type(&radv_rx9070(), 0b100_0100),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn readback_falls_back_to_the_first_coherent_type_without_cached_memory() {
+        assert_eq!(
+            find_readback_memory_type(&radv_rx9070(), 0b001_1111),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn readback_skips_cached_memory_that_is_not_coherent() {
+        let props = memory_properties(&[
+            DEVICE_LOCAL,
+            HOST_VISIBLE | HOST_CACHED,
+            HOST_VISIBLE | HOST_COHERENT,
+        ]);
+        assert_eq!(find_readback_memory_type(&props, 0b111), Some(2));
+    }
+
+    #[test]
+    fn readback_finds_nothing_without_host_visible_coherent_memory() {
+        assert_eq!(find_readback_memory_type(&radv_rx9070(), 0b000_0011), None);
     }
 }
