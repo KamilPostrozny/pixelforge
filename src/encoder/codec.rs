@@ -329,6 +329,11 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pipeline.input_image()
     }
 
+    /// See [`crate::Encoder::readback_thread_id`].
+    pub fn readback_thread_id(&self) -> Option<u32> {
+        self.common.pipeline.completion_thread_id()
+    }
+
     /// Encode one frame once `wait` is reached, returning a future for its
     /// packet. See [`crate::Encoder::encode_after`].
     pub fn encode_after(
